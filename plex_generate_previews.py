@@ -9,9 +9,13 @@ import struct
 import urllib3
 import array
 import time
+import math
+
+from datetime import timedelta
 from concurrent.futures import ProcessPoolExecutor
 
 from dotenv import load_dotenv
+from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, SpinnerColumn
 
 load_dotenv()
 
@@ -154,13 +158,27 @@ def get_amd_ffmpeg_processes():
     finally:
         amdsmi_shut_down()
 
+def human_readable_size(size_bytes):
+    """Convert size in bytes to human-readable format"""
+    if size_bytes == 0:
+        return "0 B"
+    size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB")
+    i = int(math.floor(math.log(size_bytes, 1024)))
+    p = math.pow(1024, i)
+    s = round(size_bytes / p, 2)
+    return f"{s} {size_name[i]}"
+
+def format_time(seconds):
+    """Convert seconds to HH:MM:SS format"""
+    return str(timedelta(seconds=int(seconds)))
+
 def generate_images(video_file_param, output_folder):
     video_file = video_file_param.replace(PLEX_VIDEOS_PATH_MAPPING, PLEX_LOCAL_VIDEOS_PATH_MAPPING)
     media_info = MediaInfo.parse(video_file)
     vf_parameters = "fps=fps={}:round=up,scale=w=320:h=240:force_original_aspect_ratio=decrease".format(
         round(1 / PLEX_BIF_FRAME_INTERVAL, 6))
 
-    # Check if we have a HDR Format. Note: Sometimes it can be returned as "None" (string) hence the check for None type or "None" (String)
+    # Check if we have a HDR Format
     if media_info.video_tracks:
         if media_info.video_tracks[0].hdr_format != "None" and media_info.video_tracks[0].hdr_format is not None:
             vf_parameters = "fps=fps={}:round=up,zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=w=320:h=240:force_original_aspect_ratio=decrease".format(round(1 / PLEX_BIF_FRAME_INTERVAL, 6))
@@ -197,21 +215,56 @@ def generate_images(video_file_param, output_folder):
             vf_parameters = vf_parameters.replace("scale=w=320:h=240:force_original_aspect_ratio=decrease", "format=nv12|vaapi,hwupload,scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease")
             args[args.index("-vf") + 1] = vf_parameters
 
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    video_track = next((track for track in media_info.tracks if track.track_type == "Video"), None)
+    if video_track and video_track.duration is not None:
+        video_length = float(video_track.duration) / 1000  # Convert ms to seconds
+        video_length_formatted = format_time(video_length)
+        total_expected_thumbnails = int(video_length / PLEX_BIF_FRAME_INTERVAL)
+    else:
+        video_length = 0
+        video_length_formatted = "00:00:00"  # Set to 00:00:00 if duration can't be determined
+        total_expected_thumbnails = 0
 
-    # Allow time for it to start
-    time.sleep(1)
+    file_size = os.path.getsize(video_file)
+    file_size_human = human_readable_size(file_size)
 
-    out, err = proc.communicate()
-    if proc.returncode != 0:
-        err_lines = err.decode('utf-8', 'ignore').split('\n')[-5:]
-        logger.error(err_lines)
-        logger.error('Problem trying to ffmpeg images for {}'.format(video_file))
+    logger.info(f"Generating thumbnails for [magenta]{video_file}[/magenta] ({video_length_formatted}, {file_size_human}): HW={hw}")
+
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+    last_progress = 0
+    for line in proc.stderr:
+        # Parse the progress information
+        time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2}.\d{2})', line)
+        speed_match = re.search(r'speed=\s*([\d.]+)x', line)
+
+        if time_match and speed_match:
+            hours, minutes, seconds = map(float, time_match.groups())
+            current_time = hours * 3600 + minutes * 60 + seconds
+            speed_multiple = float(speed_match.group(1))
+
+            if video_length > 0:
+                progress_percentage = min((current_time / video_length) * 100, 100)
+                thumbnails_generated = int(current_time / PLEX_BIF_FRAME_INTERVAL)
+
+                # Only log every 1% progress to avoid cluttering the output
+                if int(progress_percentage) - last_progress >= 1:
+                    logger.info(f"[magenta]{video_file}[/magenta]: "
+                                f"[bold orange]{int(progress_percentage)}[/]% | "
+                                f"[bold green]{thumbnails_generated}/{total_expected_thumbnails}[/] thumbnails "
+                                f"@ [bold blue]{speed_multiple:.2f}x[/] speed "
+                                f"(HW={hw})")
+                    last_progress = int(progress_percentage)
+
+    # Ensure we log 100% progress
+    if last_progress < 100:
+        logger.info(f"Progress for {os.path.basename(video_file)}: 100% | "
+                    f"Thumbnails: {total_expected_thumbnails}/{total_expected_thumbnails}")
 
     # Speed
     end = time.time()
     seconds = round(end - start, 1)
-    speed = re.findall('speed= ?([0-9]+\\.?[0-9]*|\\.[0-9]+)x', err.decode('utf-8', 'ignore'))
+    speed = re.findall('speed= ?([0-9]+\\.?[0-9]*|\\.[0-9]+)x', proc.stderr.read())
     if speed:
         speed = speed[-1]
 
