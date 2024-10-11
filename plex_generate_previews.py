@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import sys
 import re
 import subprocess
@@ -11,75 +12,63 @@ import array
 import time
 import math
 
+import gpustat
+import requests
+
 from datetime import timedelta
 from concurrent.futures import ProcessPoolExecutor
 
 from dotenv import load_dotenv
-from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, SpinnerColumn
+from loguru import logger
+from pymediainfo import MediaInfo
+from plexapi.server import PlexServer
+from rich.console import Console
+from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, SpinnerColumn, MofNCompleteColumn
 
 load_dotenv()
 
-PLEX_URL = os.environ.get('PLEX_URL', '')  # Plex server URL. can also use for local server: http://localhost:32400
-PLEX_TOKEN = os.environ.get('PLEX_TOKEN', '')  # Plex Authentication Token
-PLEX_BIF_FRAME_INTERVAL = int(os.environ.get('PLEX_BIF_FRAME_INTERVAL', 5))  # Interval between preview images
-THUMBNAIL_QUALITY = int(os.environ.get('THUMBNAIL_QUALITY', 4))  # Preview image quality (2-6)
-PLEX_LOCAL_MEDIA_PATH = os.environ.get('PLEX_LOCAL_MEDIA_PATH', '/path_to/plex/Library/Application Support/Plex Media Server/Media')  # Local Plex media path
-TMP_FOLDER = os.environ.get('TMP_FOLDER', '/dev/shm/plex_generate_previews')  # Temporary folder for preview generation
-PLEX_TIMEOUT = int(os.environ.get('PLEX_TIMEOUT', 60))  # Timeout for Plex API requests (seconds)
+# Plex server URL. Can also use for local server: http://localhost:32400
+PLEX_URL = os.environ.get('PLEX_URL', '')
 
-# Path mappings for remote preview generation. # So you can have another computer generate previews for your Plex server
+# Plex Authentication Token
+PLEX_TOKEN = os.environ.get('PLEX_TOKEN', '')
+
+# Interval between preview images
+PLEX_BIF_FRAME_INTERVAL = int(os.environ.get('PLEX_BIF_FRAME_INTERVAL', 5))
+
+# Preview image quality (2-6)
+THUMBNAIL_QUALITY = int(os.environ.get('THUMBNAIL_QUALITY', 4))
+
+# Local Plex media path
+PLEX_LOCAL_MEDIA_PATH = os.environ.get('PLEX_LOCAL_MEDIA_PATH', '/path_to/plex/Library/Application Support/Plex Media Server/Media')
+
+# Temporary folder for preview generation
+TMP_FOLDER = os.environ.get('TMP_FOLDER', '/dev/shm/plex_generate_previews')
+
+# Timeout for Plex API requests (seconds)
+PLEX_TIMEOUT = int(os.environ.get('PLEX_TIMEOUT', 60))
+
+# Path mappings for remote preview generation.
+# So you can have another computer generate previews for your Plex server
 # If you are running on your plex server, you can set both variables to ''
-PLEX_LOCAL_VIDEOS_PATH_MAPPING = os.environ.get('PLEX_LOCAL_VIDEOS_PATH_MAPPING', '')  # Local video path for the script
-PLEX_VIDEOS_PATH_MAPPING = os.environ.get('PLEX_VIDEOS_PATH_MAPPING', '')  # Plex server video path
 
-GPU_THREADS = int(os.environ.get('GPU_THREADS', 4))  # Number of GPU threads for preview generation
-CPU_THREADS = int(os.environ.get('CPU_THREADS', 4))  # Number of CPU threads for preview generation
+# Local video path for the script
+PLEX_LOCAL_VIDEOS_PATH_MAPPING = os.environ.get('PLEX_LOCAL_VIDEOS_PATH_MAPPING', '')
+
+# Plex server video path
+PLEX_VIDEOS_PATH_MAPPING = os.environ.get('PLEX_VIDEOS_PATH_MAPPING', '')
+
+# Number of GPU threads for preview generation
+GPU_THREADS = int(os.environ.get('GPU_THREADS', 4))
+
+# Number of CPU threads for preview generation
+CPU_THREADS = int(os.environ.get('CPU_THREADS', 4))
 
 # Set the timeout envvar for https://github.com/pkkid/python-plexapi
 os.environ["PLEXAPI_PLEXAPI_TIMEOUT"] = str(PLEX_TIMEOUT)
 
 if not shutil.which("mediainfo"):
     print('MediaInfo not found.  MediaInfo must be installed and available in PATH.')
-    sys.exit(1)
-try:
-    from pymediainfo import MediaInfo
-except ImportError:
-    print('Dependencies Missing!  Please run "pip3 install pymediainfo".')
-    sys.exit(1)
-try:
-    import gpustat
-except ImportError:
-    print('Dependencies Missing!  Please run "pip3 install gpustat".')
-    sys.exit(1)
-
-try:
-    import requests
-except ImportError:
-    print('Dependencies Missing!  Please run "pip3 install requests".')
-    sys.exit(1)
-
-try:
-    from plexapi.server import PlexServer
-except ImportError:
-    print('Dependencies Missing!  Please run "pip3 install plexapi".')
-    sys.exit(1)
-
-try:
-    from loguru import logger
-except ImportError:
-    print('Dependencies Missing!  Please run "pip3 install loguru".')
-    sys.exit(1)
-
-try:
-    from rich.console import Console
-except ImportError:
-    print('Dependencies Missing!  Please run "pip3 install rich".')
-    sys.exit(1)
-
-try:
-    from rich.progress import Progress, SpinnerColumn, MofNCompleteColumn
-except ImportError:
-    print('Dependencies Missing!  Please run "pip3 install rich".')
     sys.exit(1)
 
 FFMPEG_PATH = shutil.which("ffmpeg")
@@ -89,19 +78,19 @@ if not FFMPEG_PATH:
 
 # Logging setup
 console = Console()
+
 logger.remove()
+
 logger.add(
     lambda _: console.print(_, end=''),
     level='INFO',
-    format='<green>{time:YYYY/MM/DD HH:mm:ss}</green> | {level.icon}'
-    + '  - <level>{message}</level>',
+    format='<green>{time:YYYY/MM/DD HH:mm:ss}</green> | {level.icon} - <level>{message}</level>',
     enqueue=True
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 GPU = None
-
 
 def detect_gpu():
     # Check for NVIDIA GPUs
@@ -175,19 +164,30 @@ def format_time(seconds):
 def generate_images(video_file_param, output_folder):
     video_file = video_file_param.replace(PLEX_VIDEOS_PATH_MAPPING, PLEX_LOCAL_VIDEOS_PATH_MAPPING)
     media_info = MediaInfo.parse(video_file)
-    vf_parameters = "fps=fps={}:round=up,scale=w=320:h=240:force_original_aspect_ratio=decrease".format(
-        round(1 / PLEX_BIF_FRAME_INTERVAL, 6))
+
+    vf_parameters = (
+        "fps=fps={}:round=up,"
+        "scale=w=320:h=240:force_original_aspect_ratio=decrease"
+        ).format(round(1 / PLEX_BIF_FRAME_INTERVAL, 6))
 
     # Check if we have a HDR Format
     if media_info.video_tracks:
         if media_info.video_tracks[0].hdr_format != "None" and media_info.video_tracks[0].hdr_format is not None:
-            vf_parameters = "fps=fps={}:round=up,zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=w=320:h=240:force_original_aspect_ratio=decrease".format(round(1 / PLEX_BIF_FRAME_INTERVAL, 6))
+            vf_parameters = (
+                "fps=fps={}:round=up,"
+                "zscale=t=linear:npl=100,"
+                "format=gbrpf32le,"
+                "zscale=p=bt709,"
+                "tonemap=tonemap=hable:desat=0,"
+                "zscale=t=bt709:m=bt709:r=tv,"
+                "format=yuv420p,"
+                "scale=w=320:h=240:force_original_aspect_ratio=decrease"
+            ).format(round(1 / PLEX_BIF_FRAME_INTERVAL, 6))
 
     args = [
-        FFMPEG_PATH, "-loglevel", "info", "-skip_frame:v", "nokey", "-threads:0", "1", "-i",
-        video_file, "-an", "-sn", "-dn", "-q:v", str(THUMBNAIL_QUALITY),
-        "-vf",
-        vf_parameters, '{}/img-%06d.jpg'.format(output_folder)
+        FFMPEG_PATH, "-loglevel", "info", "-skip_frame:v", "nokey", "-threads:0", "1",
+        "-i", video_file, "-an", "-sn", "-dn", "-q:v", str(THUMBNAIL_QUALITY),
+        "-vf", vf_parameters, '{}/img-%06d.jpg'.format(output_folder)
     ]
 
     start = time.time()
@@ -215,11 +215,12 @@ def generate_images(video_file_param, output_folder):
             vf_parameters = vf_parameters.replace("scale=w=320:h=240:force_original_aspect_ratio=decrease", "format=nv12|vaapi,hwupload,scale_vaapi=w=320:h=240:force_original_aspect_ratio=decrease")
             args[args.index("-vf") + 1] = vf_parameters
 
+    # Get video length
     video_track = next((track for track in media_info.tracks if track.track_type == "Video"), None)
     if video_track and video_track.duration is not None:
         video_length = float(video_track.duration) / 1000  # Convert ms to seconds
         video_length_formatted = format_time(video_length)
-        total_expected_thumbnails = int(video_length / PLEX_BIF_FRAME_INTERVAL)
+        total_expected_thumbnails = round(video_length / PLEX_BIF_FRAME_INTERVAL)
     else:
         video_length = 0
         video_length_formatted = "00:00:00"  # Set to 00:00:00 if duration can't be determined
@@ -234,7 +235,6 @@ def generate_images(video_file_param, output_folder):
 
     last_progress = 0
     for line in proc.stderr:
-        # Parse the progress information
         time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2}.\d{2})', line)
         speed_match = re.search(r'speed=\s*([\d.]+)x', line)
 
@@ -250,23 +250,19 @@ def generate_images(video_file_param, output_folder):
                 # Only log every 1% progress to avoid cluttering the output
                 if int(progress_percentage) - last_progress >= 1:
                     logger.info(f"[magenta]{video_file}[/magenta]: "
-                                f"[bold orange]{int(progress_percentage)}[/]% | "
+                                f"[bold yellow]{int(progress_percentage)}[/]% | "
                                 f"[bold green]{thumbnails_generated}/{total_expected_thumbnails}[/] thumbnails "
-                                f"@ [bold blue]{speed_multiple:.2f}x[/] speed "
+                                f"@ [bold blue]{speed_multiple}x[/] speed "
                                 f"(HW={hw})")
                     last_progress = int(progress_percentage)
 
-    # Ensure we log 100% progress
-    if last_progress < 100:
-        logger.info(f"Progress for {os.path.basename(video_file)}: 100% | "
-                    f"Thumbnails: {total_expected_thumbnails}/{total_expected_thumbnails}")
-
-    # Speed
+    # Compute speed
     end = time.time()
-    seconds = round(end - start, 1)
-    speed = re.findall('speed= ?([0-9]+\\.?[0-9]*|\\.[0-9]+)x', proc.stderr.read())
-    if speed:
-        speed = speed[-1]
+    processing_time = end - start
+    if video_length > 0:
+        speed = video_length / processing_time
+    else:
+        speed = 0
 
     # Optimize and Rename Images
     for image in glob.glob('{}/img*.jpg'.format(output_folder)):
@@ -274,8 +270,12 @@ def generate_images(video_file_param, output_folder):
         frame_second = frame_no * PLEX_BIF_FRAME_INTERVAL
         os.rename(image, os.path.join(output_folder, '{:010d}.jpg'.format(frame_second)))
 
-    logger.info('Generated Video Preview for {} HW={} TIME={}seconds SPEED={}x '.format(video_file, hw, seconds, speed))
-
+    logger.info(
+        f"Generated [bold green]{total_expected_thumbnails}[/] thumbnails "
+        f"for [magenta]{video_file}[/]: "
+        f"took [bold green]{round(processing_time)}[/] seconds "
+        f"@ {speed}x speed (HW={HW})"
+    )
 
 def generate_bif(bif_filename, images_path):
     """
